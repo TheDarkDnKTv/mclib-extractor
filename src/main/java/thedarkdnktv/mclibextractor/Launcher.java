@@ -2,12 +2,11 @@ package thedarkdnktv.mclibextractor;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.maven.artifact.versioning.ComparableVersion;
 import thedarkdnktv.mclibextractor.exception.LaunchException;
 import thedarkdnktv.mclibextractor.gson.LibraryDeserializer;
-import thedarkdnktv.mclibextractor.model.LauncherProfile;
-import thedarkdnktv.mclibextractor.model.LauncherProfileSettings;
-import thedarkdnktv.mclibextractor.model.Library;
-import thedarkdnktv.mclibextractor.model.VersionProfile;
+import thedarkdnktv.mclibextractor.model.*;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -16,11 +15,15 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import static java.lang.System.out;
 import static java.nio.file.StandardOpenOption.*;
 
 public class Launcher implements Runnable {
+
+    private final static Pattern ARTIFACT_PATTERN;
 
     private final Gson gson;
     private final Scanner scanner;
@@ -116,20 +119,40 @@ public class Launcher implements Runnable {
     }
 
     private Set<Path> getLibraries(LauncherProfile profile) {
-        var result = new HashSet<Path>();
+        var artifacts = new HashMap<MavenArtifact, Pair<ComparableVersion, Path>>();
         var id = profile.getLastVersionId();
 
         do {
             var versionProfile = this.loadProfile(id);
-            versionProfile.getLibraries().stream()
-                .filter(Objects::nonNull)
-                .map(Library::getPath)
-                .map(mcLib::resolve)
-                .forEach(result::add);
+            for (var lib : versionProfile.getLibraries()) {
+                if (lib != null) {
+                    var artifact = this.parseArtifact(lib.getName());
+                    if (artifact != null) {
+                        var current = Pair.of(artifact.getValue(), lib.getPath());
+                        var previous = artifacts.get(artifact.getKey());
+
+                        if (previous != null) {
+                            out.printf("Found artifact duplicate for [%s], versions are %s and %s\n", artifact.getKey(), current.getKey(), previous.getKey());
+                            if (previous.getKey().compareTo(current.getKey()) > 0) {
+                                current = previous;
+                            }
+
+                            out.println("\tselecting version " + current.getKey());
+                        }
+
+                        artifacts.put(artifact.getKey(), current);
+                    }
+                }
+            }
+
             id = versionProfile.getInheritsFrom();
         } while (id != null && !id.isBlank());
 
-        return result;
+        return artifacts.values().stream()
+            .map(Pair::getValue)
+            .filter(Objects::nonNull)
+            .map(mcLib::resolve)
+            .collect(Collectors.toSet());
     }
 
     private VersionProfile loadProfile(String id) {
@@ -142,6 +165,17 @@ public class Launcher implements Runnable {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    private Pair<MavenArtifact, ComparableVersion> parseArtifact(String name) {
+        var matcher = ARTIFACT_PATTERN.matcher(name);
+        if (matcher.lookingAt()) {
+            var mvn = new MavenArtifact(matcher.group(1), matcher.group(2));
+            var version = new ComparableVersion(matcher.group(3));
+            return Pair.of(mvn, version);
+        }
+
+        return null;
     }
 
     private void copyLibraries(Set<Path> libs) throws IOException {
@@ -170,5 +204,9 @@ public class Launcher implements Runnable {
                 }
             }
         }
+    }
+
+    static {
+        ARTIFACT_PATTERN = Pattern.compile("(.+):(.+):(.+)");
     }
 }
