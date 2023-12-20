@@ -2,21 +2,24 @@ package thedarkdnktv.mclibextractor;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.maven.artifact.versioning.ComparableVersion;
 import thedarkdnktv.mclibextractor.exception.LaunchException;
 import thedarkdnktv.mclibextractor.gson.LibraryDeserializer;
 import thedarkdnktv.mclibextractor.model.*;
 
+import java.io.BufferedInputStream;
 import java.io.BufferedReader;
 import java.io.IOException;
+import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
+import java.nio.channels.ReadableByteChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 import static java.lang.System.out;
 import static java.nio.file.StandardOpenOption.*;
@@ -29,8 +32,9 @@ public class Launcher implements Runnable {
     private final Scanner scanner;
     private final Path mcDir;
     private final Path mcLib;
+    private final boolean downloadLibraries;
 
-    public Launcher() {
+    public Launcher(boolean doDownload) {
         this.scanner = new Scanner(System.in);
         this.gson = new GsonBuilder()
             .serializeNulls()
@@ -41,10 +45,11 @@ public class Launcher implements Runnable {
             .orElseGet(() -> System.getProperty("user.home"));
         this.mcDir = Paths.get(path, ".minecraft");
         this.mcLib = mcDir.resolve("libraries");
+        this.downloadLibraries = doDownload;
     }
 
     public static void main(String[] arguments) {
-        new Launcher().run();
+        new Launcher(!ArrayUtils.contains(arguments, "nodownload")).run();
     }
 
     @Override
@@ -88,7 +93,7 @@ public class Launcher implements Runnable {
 
             var libs = this.getLibraries(profileList.get(selected));
             try {
-                this.copyLibraries(libs);
+                this.processDependencies(libs);
             } catch (IOException e) {
                 throw new LaunchException("Unable to copy libraries", e);
             }
@@ -118,8 +123,8 @@ public class Launcher implements Runnable {
         }
     }
 
-    private Set<Path> getLibraries(LauncherProfile profile) {
-        var artifacts = new HashMap<MavenArtifact, Pair<ComparableVersion, Path>>();
+    private Set<Dependency> getLibraries(LauncherProfile profile) {
+        var dependencies = new HashMap<Dependency, Dependency>();
         var id = profile.getLastVersionId();
 
         do {
@@ -128,19 +133,25 @@ public class Launcher implements Runnable {
                 if (lib != null) {
                     var artifact = this.parseArtifact(lib.getName());
                     if (artifact != null) {
-                        var current = Pair.of(artifact.getValue(), lib.getPath());
-                        var previous = artifacts.get(artifact.getKey());
+                        var current = new Dependency(artifact.getKey(), artifact.getValue(), lib.getPath())
+                                .setDownloadUrl(lib.getUrl())
+                                .setNative(lib.isNative());
 
-                        if (previous != null) {
-                            out.printf("Found artifact duplicate for [%s], versions are %s and %s\n", artifact.getKey(), current.getKey(), previous.getKey());
-                            if (previous.getKey().compareTo(current.getKey()) > 0) {
-                                current = previous;
+                        dependencies.merge(current, current, (key, previous) -> {
+                            out.printf("Found artifact duplicate for [%s], versions are %s and %s\n",
+                                    key.getArtifact(),
+                                    current.getVersion(),
+                                    previous.getVersion());
+                            if (current.getVersion().compareTo(previous.getVersion()) > 0) {
+                                previous = current;
                             }
 
-                            out.println("\tselecting version " + current.getKey());
-                        }
+                            out.println("\tselecting version " + previous.getVersion());
+                            return previous;
+                        });
 
-                        artifacts.put(artifact.getKey(), current);
+
+                        dependencies.put(current, current);
                     }
                 }
             }
@@ -148,11 +159,7 @@ public class Launcher implements Runnable {
             id = versionProfile.getInheritsFrom();
         } while (id != null && !id.isBlank());
 
-        return artifacts.values().stream()
-            .map(Pair::getValue)
-            .filter(Objects::nonNull)
-            .map(mcLib::resolve)
-            .collect(Collectors.toSet());
+        return new HashSet<>(dependencies.values());
     }
 
     private VersionProfile loadProfile(String id) {
@@ -170,7 +177,7 @@ public class Launcher implements Runnable {
     private Pair<MavenArtifact, ComparableVersion> parseArtifact(String name) {
         var matcher = ARTIFACT_PATTERN.matcher(name);
         if (matcher.lookingAt()) {
-            var mvn = new MavenArtifact(matcher.group(1), matcher.group(2));
+            var mvn = new MavenArtifact(matcher.group(1), matcher.group(2), matcher.group(4));
             var version = new ComparableVersion(matcher.group(3));
             return Pair.of(mvn, version);
         }
@@ -178,35 +185,62 @@ public class Launcher implements Runnable {
         return null;
     }
 
-    private void copyLibraries(Set<Path> libs) throws IOException {
-        final var localDir = Paths.get(".")
-            .toAbsolutePath()
-            .normalize()
-            .resolve("libraries");
+    private void processDependencies(Set<Dependency> libs) throws IOException {
+        Path root = Paths.get(".")
+                .toAbsolutePath()
+                .normalize();
+        final var localDir = root.resolve("libraries");
+        final var nativesDir = root.resolve("natives");
         if (Files.notExists(localDir)) {
             Files.createDirectories(localDir);
         }
 
-        for (Path lib : libs) {
-            if (Files.notExists(lib)) {
+        if (Files.notExists(nativesDir)) {
+            Files.createDirectories(nativesDir);
+        }
+
+        for (var lib : libs) {
+            var libPath = lib.getPath();
+
+            var localLib = (lib.isNative() ? nativesDir : localDir).resolve(libPath);
+            var localLibFolder = localLib.getParent();
+            var mcLibrary = this.mcLib.resolve(libPath);
+            var download = false;
+
+            if (Files.notExists(mcLibrary)) {
+                if (this.downloadLibraries) {
+                    download = true;
+                } else {
+                    out.println("ERR Library not found at MC folder: " + lib.getArtifact() + ", path: " + libPath);
+                    continue;
+                }
+            }
+
+            if (Files.notExists(localLibFolder)) {
+                Files.createDirectories(localLibFolder);
+            }
+
+            if (download && lib.getDownloadUrl() == null) {
+                out.printf("ERR can not download library [%s] as URL is empty\n", lib.getArtifact());
                 continue;
             }
 
-            var localLib = localDir.resolve(mcLib.relativize(lib.getParent()));
-            if (Files.notExists(localLib)) {
-                Files.createDirectories(localLib);
-            }
-
-            try (var fci = FileChannel.open(lib, READ)) {
-                var localLibPath = localLib.resolve(lib.getFileName());
-                try (var fco = FileChannel.open(localLibPath, WRITE, CREATE, TRUNCATE_EXISTING)) {
+            try (var fci = download ? this.downloadDependency(lib) : FileChannel.open(mcLibrary, READ)) {
+                try (var fco = FileChannel.open(localLib, WRITE, CREATE, TRUNCATE_EXISTING)) {
                     fco.transferFrom(fci, 0, Long.MAX_VALUE);
                 }
             }
         }
     }
 
+    private ReadableByteChannel downloadDependency(Dependency dependency) throws IOException {
+        out.println("INFO Downloading library " + dependency.getArtifact());
+        var connection = dependency.getDownloadUrl().openConnection();
+        connection.connect();
+        return Channels.newChannel(connection.getInputStream());
+    }
+
     static {
-        ARTIFACT_PATTERN = Pattern.compile("(.+):(.+):(.+)");
+        ARTIFACT_PATTERN = Pattern.compile("^([[^:].]+):([[^:].]+):([[^:].]+)(?::([[^:].]+))?$");
     }
 }

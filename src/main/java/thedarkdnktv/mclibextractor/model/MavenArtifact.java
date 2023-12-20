@@ -5,7 +5,8 @@ import org.apache.commons.lang3.builder.HashCodeBuilder;
 
 public record MavenArtifact(
     String group,
-    String id
+    String id,
+    String type
 ) {
 
     @Override
@@ -16,6 +17,7 @@ public record MavenArtifact(
         return new EqualsBuilder()
             .append(group, that.group)
             .append(id, that.id)
+            .append(type, that.type)
             .isEquals();
     }
 
@@ -24,11 +26,18 @@ public record MavenArtifact(
         return new HashCodeBuilder(17, 37)
             .append(group)
             .append(id)
+            .append(type)
             .toHashCode();
     }
 
     @Override
     public String toString() {
-        return this.group + ":" + this.id;
+        var result = this.group + ":" + this.id;
+
+        if (this.type != null) {
+            result += ":" + this.type;
+        }
+
+        return result;
     }
 }

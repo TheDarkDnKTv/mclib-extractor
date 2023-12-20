@@ -8,7 +8,6 @@ import thedarkdnktv.mclibextractor.model.Library;
 
 import java.lang.reflect.Type;
 import java.nio.file.InvalidPathException;
-import java.nio.file.Path;
 import java.nio.file.Paths;
 
 public class LibraryDeserializer implements JsonDeserializer<Library> {
@@ -17,17 +16,26 @@ public class LibraryDeserializer implements JsonDeserializer<Library> {
     public Library deserialize(JsonElement json, Type typeOfT, JsonDeserializationContext context) throws JsonParseException {
         if (json.isJsonObject()) {
             var obj = json.getAsJsonObject();
-            var name = obj.get("name").getAsString();
-            Path path = null;
+            var result = new Library(obj.get("name").getAsString());
 
             json = obj.get("downloads");
             if (json != null && json.isJsonObject()) {
                 json = json.getAsJsonObject().get("artifact");
                 if (json != null && json.isJsonObject()) {
-                    json = json.getAsJsonObject().get("path");
-                    if (json != null) {
+                    var pathJson = json.getAsJsonObject().get("path");
+                    var urlJson = json.getAsJsonObject().get("url");
+
+                    if (pathJson != null) {
                         try {
-                            path = Paths.get(json.getAsString());
+                            result.setPath(Paths.get(pathJson.getAsString()));
+                        } catch (InvalidPathException e) {
+                            throw new JsonParseException(e);
+                        }
+                    }
+
+                    if (urlJson != null) {
+                        try {
+                            result.setUrl(urlJson.getAsString());
                         } catch (InvalidPathException e) {
                             throw new JsonParseException(e);
                         }
@@ -35,8 +43,20 @@ public class LibraryDeserializer implements JsonDeserializer<Library> {
                 }
             }
 
-            if (path != null) {
-                return new Library(name, path);
+            json = obj.get("rules");
+            if (json != null && json.isJsonArray()) {
+                var optional = json.getAsJsonArray()
+                        .asList()
+                        .stream()
+                        .filter(JsonElement::isJsonObject)
+                        .map(JsonElement::getAsJsonObject)
+                        .filter(e -> e.has("os"))
+                        .findFirst();
+                result.setNative(optional.isPresent());
+            }
+
+            if (result.getPath() != null) {
+                return result;
             }
         }
 
