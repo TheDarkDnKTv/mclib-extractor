@@ -1,16 +1,11 @@
 package thedarkdnktv.mclibextractor;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
 import org.apache.commons.lang3.ArrayUtils;
-import org.apache.commons.lang3.tuple.Pair;
-import org.apache.maven.artifact.versioning.ComparableVersion;
+import thedarkdnktv.mclibextractor.api.IMinecraftDependencyService;
 import thedarkdnktv.mclibextractor.exception.LaunchException;
-import thedarkdnktv.mclibextractor.gson.LibraryDeserializer;
-import thedarkdnktv.mclibextractor.model.*;
+import thedarkdnktv.mclibextractor.api.impl.MinecraftDependencyServiceImpl;
+import thedarkdnktv.mclibextractor.model.Dependency;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedReader;
 import java.io.IOException;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
@@ -19,36 +14,30 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
-import java.util.regex.Pattern;
 
 import static java.lang.System.out;
 import static java.nio.file.StandardOpenOption.*;
 
 public class Launcher implements Runnable {
 
-    private final static Pattern ARTIFACT_PATTERN;
+    private final IMinecraftDependencyService dependencyService;
 
-    private final Gson gson;
     private final Scanner scanner;
     private final Path mcDir;
     private final Path mcLib;
     private final boolean downloadLibraries;
 
     public Launcher(boolean doDownload) {
+        this.dependencyService = new MinecraftDependencyServiceImpl();
         this.scanner = new Scanner(System.in);
-        this.gson = new GsonBuilder()
-            .serializeNulls()
-            .setPrettyPrinting()
-            .registerTypeAdapter(Library.class, new LibraryDeserializer())
-            .create();
-        var path = Optional.ofNullable(System.getenv("APPDATA"))
-            .orElseGet(() -> System.getProperty("user.home"));
-        this.mcDir = Paths.get(path, ".minecraft");
+        this.mcDir = this.dependencyService.getDirectory();
         this.mcLib = mcDir.resolve("libraries");
         this.downloadLibraries = doDownload;
     }
 
     public static void main(String[] arguments) {
+        var s = ServiceLoader.load(IMinecraftDependencyService.class).findFirst();
+
         new Launcher(!ArrayUtils.contains(arguments, "nodownload")).run();
     }
 
@@ -60,8 +49,7 @@ public class Launcher implements Runnable {
             }
 
             out.println("Loading profiles");
-            var profiles = this.loadSettings();
-            var profileList = new ArrayList<>(profiles.getProfiles().values());
+            var profileList = new ArrayList<>(this.dependencyService.loadSettings().getProfiles().values());
             out.println("Loaded " + profileList.size() + " launcher profiles:");
             for (int i = 0; i < profileList.size(); i ++) {
                 out.printf("\t[%d]: %s (%s)\n", i, profileList.get(i).getName(), profileList.get(i).getType());
@@ -91,7 +79,7 @@ public class Launcher implements Runnable {
                 }
             }
 
-            var libs = this.getLibraries(profileList.get(selected));
+            var libs = this.dependencyService.loadLibraries(profileList.get(selected));
             try {
                 this.processDependencies(libs);
             } catch (IOException e) {
@@ -107,82 +95,10 @@ public class Launcher implements Runnable {
             }
 
             System.exit(e.getExitCode());
-        }
-    }
-
-    private LauncherProfileSettings loadSettings() throws LaunchException {
-        var profiles = mcDir.resolve("launcher_profiles.json");
-        if (Files.notExists(profiles)) {
-            throw new LaunchException("Profiles file not found, run launcher first!", 2);
-        }
-
-        try (BufferedReader reader = Files.newBufferedReader(profiles)) {
-            return gson.fromJson(reader, LauncherProfileSettings.class);
         } catch (IOException e) {
-            throw new LaunchException(e);
+            e.printStackTrace(System.err);
+            System.exit(2);
         }
-    }
-
-    private Set<Dependency> getLibraries(LauncherProfile profile) {
-        var dependencies = new HashMap<Dependency, Dependency>();
-        var id = profile.getLastVersionId();
-
-        do {
-            var versionProfile = this.loadProfile(id);
-            for (var lib : versionProfile.getLibraries()) {
-                if (lib != null) {
-                    var artifact = this.parseArtifact(lib.getName());
-                    if (artifact != null) {
-                        var current = new Dependency(artifact.getKey(), artifact.getValue(), lib.getPath())
-                                .setDownloadUrl(lib.getUrl())
-                                .setNative(lib.isNative());
-
-                        dependencies.merge(current, current, (key, previous) -> {
-                            out.printf("Found artifact duplicate for [%s], versions are %s and %s\n",
-                                    key.getArtifact(),
-                                    current.getVersion(),
-                                    previous.getVersion());
-                            if (current.getVersion().compareTo(previous.getVersion()) > 0) {
-                                previous = current;
-                            }
-
-                            out.println("\tselecting version " + previous.getVersion());
-                            return previous;
-                        });
-
-
-                        dependencies.put(current, current);
-                    }
-                }
-            }
-
-            id = versionProfile.getInheritsFrom();
-        } while (id != null && !id.isBlank());
-
-        return new HashSet<>(dependencies.values());
-    }
-
-    private VersionProfile loadProfile(String id) {
-        var file = mcDir.resolve("versions")
-            .resolve(id)
-            .resolve(id + ".json");
-
-        try (var buffer = Files.newBufferedReader(file)) {
-            return gson.fromJson(buffer, VersionProfile.class);
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    private Pair<MavenArtifact, ComparableVersion> parseArtifact(String name) {
-        var matcher = ARTIFACT_PATTERN.matcher(name);
-        if (matcher.lookingAt()) {
-            var mvn = new MavenArtifact(matcher.group(1), matcher.group(2), matcher.group(4));
-            var version = new ComparableVersion(matcher.group(3));
-            return Pair.of(mvn, version);
-        }
-
-        return null;
     }
 
     private void processDependencies(Set<Dependency> libs) throws IOException {
@@ -238,9 +154,5 @@ public class Launcher implements Runnable {
         var connection = dependency.getDownloadUrl().openConnection();
         connection.connect();
         return Channels.newChannel(connection.getInputStream());
-    }
-
-    static {
-        ARTIFACT_PATTERN = Pattern.compile("^([[^:].]+):([[^:].]+):([[^:].]+)(?::([[^:].]+))?$");
     }
 }
