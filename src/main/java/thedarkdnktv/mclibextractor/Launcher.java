@@ -36,8 +36,6 @@ public class Launcher implements Runnable {
     }
 
     public static void main(String[] arguments) {
-        var s = ServiceLoader.load(IMinecraftDependencyService.class).findFirst();
-
         new Launcher(!ArrayUtils.contains(arguments, "nodownload")).run();
     }
 
